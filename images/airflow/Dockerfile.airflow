@@ -1,0 +1,19 @@
+FROM apache/airflow:2.11.2-python3.12
+
+USER airflow
+
+RUN pip install --no-cache-dir --no-deps \
+    yandexcloud==0.379.0 \
+    apache-airflow-providers-yandex==4.4.2
+
+RUN pip install --no-cache-dir \
+    grpcio==1.71.0 \
+    grpcio-tools==1.71.0 \
+    protobuf==5.29.5 \
+    cryptography==44.0.2 \
+    deprecated==1.2.18 \
+    requests==2.32.3 \
+    yandex-query-client>=0.1.4 \
+    apache-airflow-providers-common-compat>=1.13.0
+
+RUN pip uninstall -y apache-airflow-providers-google || true

@@ -1,0 +1,276 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-dags-pvc
+  namespace: mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow
+  template:
+    metadata:
+      labels:
+        app: airflow
+    spec:
+      securityContext:
+        runAsUser: 50000
+        fsGroup: 50000
+
+      initContainers:
+      - name: git-clone
+        image: alpine/git:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "⏳ Cloning DAGs from Git repository..."
+          rm -rf /dags/*
+          git clone https://github.com/o-albot/otus-mlops-course-project.git /tmp/repo
+          cp -r /tmp/repo/dags/* /dags/ || echo "No DAGs found"
+          echo "✅ DAGs cloned successfully"
+          ls -la /dags/
+        volumeMounts:
+        - name: dags
+          mountPath: /dags
+
+      - name: init-db
+        image: ghcr.io/o-albot/airflow-custom:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "⏳ Waiting for PostgreSQL..."
+          until nc -z postgres 5432; do
+            sleep 2
+          done
+          echo "✅ PostgreSQL is ready"
+
+          echo "📦 Initializing Airflow database..."
+          export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow_user:airflow_pass@postgres:5432/airflow_db
+          airflow db init
+
+          echo "👤 Creating admin user..."
+          airflow users create \
+            --username admin \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email admin@example.com \
+            --password admin 2>/dev/null || echo "⚠️ User already exists"
+
+          echo "✅ Airflow initialization complete"
+        env:
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: LocalExecutor
+        - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "False"
+
+      - name: init-s3
+        image: ghcr.io/o-albot/airflow-custom:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "⏳ Waiting for S3..."
+          until curl -s ${S3_ENDPOINT} > /dev/null; do
+            sleep 2
+          done
+          echo "✅ S3 is reachable"
+
+          echo "📦 Installing boto3..."
+          pip install boto3
+
+          echo "🔧 Creating S3 connection in Airflow..."
+          export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow_user:airflow_pass@postgres:5432/airflow_db
+          airflow connections add 's3_default' \
+            --conn-type 'aws' \
+            --conn-login ${AWS_ACCESS_KEY_ID} \
+            --conn-password ${AWS_SECRET_ACCESS_KEY} \
+            --conn-extra "{\"endpoint_url\": \"${S3_ENDPOINT}\", \"region_name\": \"${AWS_DEFAULT_REGION}\"}"
+          echo "✅ S3 initialization complete"
+        env:
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: LocalExecutor
+        - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "False"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: S3_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_ENDPOINT
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_DEFAULT_REGION
+
+      containers:
+      - name: webserver
+        image: ghcr.io/o-albot/airflow-custom:latest
+        command: ["airflow", "webserver"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: postgresql+psycopg2://airflow_user:airflow_pass@postgres:5432/airflow_db
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: LocalExecutor
+        - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "False"
+        - name: AIRFLOW__WEBSERVER__EXPOSE_CONFIG
+          value: "True"
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow:5000
+        - name: AIRFLOW_CONN_S3_DEFAULT
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AIRFLOW_CONN_S3
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_BUCKET
+        - name: S3_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_ENDPOINT
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AIRFLOW__CORE__FERNET_KEY
+          value: ""
+        volumeMounts:
+        - name: dags
+          mountPath: /opt/airflow/dags
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+      - name: scheduler
+        image: ghcr.io/o-albot/airflow-custom:latest
+        command: ["airflow", "scheduler"]
+        env:
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: postgresql+psycopg2://airflow_user:airflow_pass@postgres:5432/airflow_db
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: LocalExecutor
+        - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: "False"
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow:5000
+        - name: AIRFLOW_CONN_S3_DEFAULT
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AIRFLOW_CONN_S3
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_BUCKET
+        - name: S3_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_ENDPOINT
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AIRFLOW__CORE__FERNET_KEY
+          value: ""
+        volumeMounts:
+        - name: dags
+          mountPath: /opt/airflow/dags
+
+      - name: git-sync
+        image: alpine/git:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "🔄 Starting periodic Git sync every 60 seconds..."
+          sleep 30
+          while true; do
+            echo "$(date): Syncing with Git repository..."
+            if [ ! -d /tmp/repo ]; then
+              git clone https://github.com/o-albot/otus-mlops-course-project.git /tmp/repo
+            else
+              cd /tmp/repo && git pull origin main
+            fi
+            cp -r /tmp/repo/dags/* /dags/ || echo "No DAGs found."
+            echo "✅ Sync completed. Next sync in 60 seconds..."
+            sleep 60
+          done
+        volumeMounts:
+        - name: dags
+          mountPath: /dags
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "25m"
+          limits:
+            memory: "128Mi"
+            cpu: "50m"
+
+      volumes:
+      - name: dags
+        persistentVolumeClaim:
+          claimName: airflow-dags-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow
+  namespace: mlops
+spec:
+  type: LoadBalancer
+  selector:
+    app: airflow
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080

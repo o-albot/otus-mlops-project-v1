@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      initContainers:
+      - name: install-deps
+        image: python:3.10-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install --no-cache-dir --target=/packages psycopg2-binary boto3
+        volumeMounts:
+        - name: packages
+          mountPath: /packages
+      containers:
+      - name: mlflow
+        image: ghcr.io/mlflow/mlflow:v2.22.0
+        command: ["mlflow", "server"]
+        args:
+        - "--host=0.0.0.0"
+        - "--port=5000"
+        - "--backend-store-uri=postgresql://mlflow_user:mlflow_pass@postgres:5432/mlflow_db"
+        - "--default-artifact-root=s3://mlops-gnvw/artifacts/"
+        - "--serve-artifacts"
+        ports:
+        - containerPort: 5000
+        env:
+        - name: MLFLOW_TRACKING_URI
+          value: http://localhost:5000
+        - name: PYTHONPATH
+          value: /packages
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: MLFLOW_S3_ENDPOINT_URL
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: S3_ENDPOINT
+        - name: AWS_REGION
+          value: "ru-central1"
+        - name: AWS_DEFAULT_REGION
+          value: "ru-central1"
+        volumeMounts:
+        - name: packages
+          mountPath: /packages
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      volumes:
+      - name: packages
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  selector:
+    app: mlflow
+  ports:
+  - protocol: TCP
+    port: 5000
+    targetPort: 5000
+  type: LoadBalancer
